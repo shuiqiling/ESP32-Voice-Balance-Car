@@ -1,0 +1,11 @@
+#ifndef MYHAL_ENCODER_H
+#define MYHAL_ENCODER_H
+
+#include "Config_ENCODER.h"
+#include "stdint.h"
+
+void MYHAL_ENCODER_Init(BSP_ENCODER_ID_m MYHAL_ENCODER_ID);
+int MYHAL_ENCODER_GetCounter(BSP_ENCODER_ID_m MYHAL_ENCODER_ID);
+int MYHAL_ENCODER_GetSpeedCounter(BSP_ENCODER_ID_m MYHAL_ENCODER_ID);
+
+#endif

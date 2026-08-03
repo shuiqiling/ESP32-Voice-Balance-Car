@@ -1,0 +1,13 @@
+# This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 5.5.4 Project Minimal Configuration
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 16MB flash + 自定义分区表(factory 1.94MB,装得下 AI/ASR/TLS 大固件)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16MiB.csv"
+
+# 1000Hz tick(1ms),控制环 5ms 周期需要;100Hz 下 pdMS_TO_TICKS(5)=0 会导致 vTaskDelay 不阻塞
+CONFIG_FREERTOS_HZ=1000

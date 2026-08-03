@@ -1,0 +1,32 @@
+menu "AI 语音控制配置"
+
+config DEEPSEEK_API_KEY
+    string "DeepSeek API Key (sk-...)"
+    default ""
+    help
+        DeepSeek API 密钥。通过 idf.py menuconfig 填入,或写入 sdkconfig(已被 gitignore,
+        不会提交到仓库)。留空时 AI 请求会直接失败并打印日志。
+
+config DEEPSEEK_MODEL
+    string "DeepSeek 模型名"
+    default "deepseek-v4-flash"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        平衡车连接的 WiFi 名称。留空时不做网络连接。
+
+config WIFI_PASSWORD
+    string "WiFi 密码"
+    default ""
+
+config ASR_TOKEN
+    string "阿里云 NLS ASR token"
+    default ""
+
+config ASR_APPKEY
+    string "阿里云 NLS ASR appkey"
+    default ""
+
+endmenu

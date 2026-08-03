@@ -1,0 +1,13 @@
+#ifndef MYHAL_MOTOR_H
+#define MYHAL_MOTOR_H
+
+#include "Config_MOTOR.h"
+#include "stdint.h"
+
+void MYHAL_MOTOR_Init(BSP_MOTOR_m MYHAL_MOTOR_ID);
+void MYHAL_MOTOR_FORWARD(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed);
+void MYHAL_MOTOR_MOVEBACK(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed);
+void MYHAL_MOTOR_STOP(BSP_MOTOR_m MYHAL_MOTOR_ID);
+void MYHAL_MOTOR_MOVE(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed);
+
+#endif

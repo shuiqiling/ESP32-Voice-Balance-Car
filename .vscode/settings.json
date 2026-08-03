@@ -1,0 +1,21 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "d:\\esp\\esp-idf\\v5.5.4\\esp-idf",
+  "idf.pythonInstallPath": "d:\\esp\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.portWin": "COM10",
+  "idf.toolsPathWin": "d:\\esp\\Espressif",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "d:\\esp\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\esp\\esp32_project\\02_key_control_led\\02_key_control_led_v2\\build"
+  ],
+  "idf.currentSetup": "d:\\esp\\esp-idf\\v5.5.4\\esp-idf",
+  "idf.flashType": "UART"
+}
