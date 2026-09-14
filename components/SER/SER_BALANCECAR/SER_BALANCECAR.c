@@ -105,9 +105,23 @@ void SER_BALANCECAR_Task(void *arg){
     const int32_t TIMEOUT_MS = 15000;   /* 15秒超时强制完成 */
 
     while(1){
-        /* ① 空闲时取命令(busy 期间不取,保证动作排队的串行) */
+        /* ① 空闲时取命令(busy 期间不取,保证动作排队的串行)。
+         * 串口 pos 优先于 AI:手动调试要能压过语音指令。*/
         ai_cmd_t cmd;
-        if (!busy && xQueueReceive(ai_cmd_queue, &cmd, 0) == pdPASS) {
+        bool got_cmd = false;
+
+        if (!busy && ser_pos_cmd_pending) {
+            /* 取值和清标志必须在同一临界区内,与 dbg_io 任务的写入配对。
+             * 先清标志再读值会在跨核场景下读到"新命令的右轮 + 旧命令的左轮"。*/
+            portENTER_CRITICAL(&ser_pos_mux);
+            target_r = ser_pos_target_r;
+            target_l = ser_pos_target_l;
+            ser_pos_cmd_pending = false;      /* 先消费再执行,避免同一条命令重复触发 */
+            portEXIT_CRITICAL(&ser_pos_mux);
+            got_cmd = true;
+            ESP_LOGI(TAG, "pos cmd target:(%.0f,%.0f)", target_r, target_l);
+        }
+        else if (!busy && xQueueReceive(ai_cmd_queue, &cmd, 0) == pdPASS) {
             float cur_mm_r = MYHAL_ENCODER_GetCounter(BSP_ENCODER_RIGHT)
                            * MiliPerEncoderCount / SER_BALANCECAR_Encoder_CPR;
             float cur_mm_l = MYHAL_ENCODER_GetCounter(BSP_ENCODER_LEFT)
@@ -122,9 +136,13 @@ void SER_BALANCECAR_Task(void *arg){
 
             target_r = cur_mm_r + inc_r;
             target_l = cur_mm_l + inc_l;
+            got_cmd = true;
+            ESP_LOGI(TAG, "act: %s val=%d target:(%.0f,%.0f)", cmd.cmd, cmd.cmd_value, target_r, target_l);
+        }
+
+        if (got_cmd) {
             busy = true;
             busy_tick = xTaskGetTickCount();
-            ESP_LOGI(TAG, "act: %s val=%d target:(%.0f,%.0f)", cmd.cmd, cmd.cmd_value, target_r, target_l);
         }
 
         if (busy) {

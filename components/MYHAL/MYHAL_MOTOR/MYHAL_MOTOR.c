@@ -3,6 +3,7 @@
 #include "driver/mcpwm_prelude.h"
 #include "driver/gpio.h"
 #include <stdio.h>
+#include <math.h>
 
 #define HAL_MOTOR_PERIOD 500
 #define HAL_MOTOR_RESOLUTION 1000000
@@ -128,12 +129,26 @@ void MYHAL_MOTOR_Init(BSP_MOTOR_m MYHAL_MOTOR_ID){
     }
 }
 
+/* 方向专用入口(和 MOVEBACK)只接受 0~100 的正值,要反向请调用对方。
+ * 原来直接把 Speed 乘完就转 uint32_t:传负数(或 NaN)会落进"浮点转无符号"
+ * 的未定义行为,实测得到 0xFFFFFF06 这种巨值 —— 比较值远超周期,输出恒高,
+ * 表现是"要求反转却满速正转"。MOVE 里已经挡了,这两个公开入口同样要挡。*/
+static uint32_t MOTOR_DUTY_TICKS(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed, const char *who)
+{
+    if (isnan(Speed) || Speed < 0.0f) {
+        printf("MOTOR %s: bad speed %.2f (id=%d), force 0\n", who, Speed, (int)MYHAL_MOTOR_ID);
+        Speed = 0.0f;
+    }
+    if (Speed > 100.0f) Speed = 100.0f;
+    return (uint32_t)(Speed * HAL_MOTOR_PERIOD / 100.0f);
+}
+
 void MYHAL_MOTOR_FORWARD(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed){
     /* 先关反向桥再开正向桥,避免换向瞬间 IN1/IN2 同时为高(瞬时刹车大电流) */
     gpio_set_level(BSP_MOTORS[MYHAL_MOTOR_ID].BSP_MOTOR_IN2, 0);
     gpio_set_level(BSP_MOTORS[MYHAL_MOTOR_ID].BSP_MOTOR_IN1, 1);
     esp_err_t ret;
-    uint32_t ticks = (uint32_t)(Speed * HAL_MOTOR_PERIOD / 100.0f);
+    uint32_t ticks = MOTOR_DUTY_TICKS(MYHAL_MOTOR_ID, Speed, "FORWARD");
     ret = mcpwm_comparator_set_compare_value(MYHAL_MOTOR_Comparator_HANDLE[MYHAL_MOTOR_ID], ticks);
     if(ret != ESP_OK){
         printf("MOTOR FORWARD SET SPEED FAIL: %s\n", esp_err_to_name(ret));
@@ -146,7 +161,7 @@ void MYHAL_MOTOR_MOVEBACK(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed){
     gpio_set_level(BSP_MOTORS[MYHAL_MOTOR_ID].BSP_MOTOR_IN1, 0);
     gpio_set_level(BSP_MOTORS[MYHAL_MOTOR_ID].BSP_MOTOR_IN2, 1);
     esp_err_t ret;
-    uint32_t ticks = (uint32_t)(Speed * HAL_MOTOR_PERIOD / 100.0f);
+    uint32_t ticks = MOTOR_DUTY_TICKS(MYHAL_MOTOR_ID, Speed, "MOVEBACK");
     ret = mcpwm_comparator_set_compare_value(MYHAL_MOTOR_Comparator_HANDLE[MYHAL_MOTOR_ID], ticks);
     if(ret != ESP_OK){
         printf("MOTOR MOVEBACK SET SPEED FAIL: %s\n", esp_err_to_name(ret));
@@ -160,14 +175,25 @@ void MYHAL_MOTOR_STOP(BSP_MOTOR_m MYHAL_MOTOR_ID){
 }
 
 void MYHAL_MOTOR_MOVE(BSP_MOTOR_m MYHAL_MOTOR_ID, float Speed){
-    if(Speed >= 0.0f){
-        MYHAL_MOTOR_FORWARD(MYHAL_MOTOR_ID, Speed);
-    } 
-    else if(Speed < 0.0f){
-        MYHAL_MOTOR_MOVEBACK(MYHAL_MOTOR_ID, -Speed);
-    }
-    else{
+    /* NaN 与任何值比较都为假,不先挡掉会直接穿过全部分支落到 else */
+    if (isnan(Speed)) {
         MYHAL_MOTOR_STOP(MYHAL_MOTOR_ID);
+        return;
     }
 
+    /* 占空比超出量程会让比较值超过周期,输出恒高(相当于满速堵转),先夹住 */
+    if (Speed >  100.0f) Speed =  100.0f;
+    if (Speed < -100.0f) Speed = -100.0f;
+
+    /* 原来写成 if(>=0) / else if(<0) / else,else 永远到不了,STOP 是死代码。
+     * PID 输出被夹到 ±100,恰好为 0 是可能的,这条分支需要真的存在。*/
+    if (Speed > 0.0f) {
+        MYHAL_MOTOR_FORWARD(MYHAL_MOTOR_ID, Speed);
+    }
+    else if (Speed < 0.0f) {
+        MYHAL_MOTOR_MOVEBACK(MYHAL_MOTOR_ID, -Speed);
+    }
+    else {
+        MYHAL_MOTOR_STOP(MYHAL_MOTOR_ID);
+    }
 }

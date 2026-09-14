@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
 #include "driver/i2s_std.h"
 #include "BSP_MIC.h"
 #include "esp_log.h"
@@ -18,15 +19,23 @@
 static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
 static StreamBufferHandle_t mic_stream = NULL;
+static uint32_t play_fail_count = 0;
+
+/* Play 会被 asr_send_task(本地监听)和 tts_play_task(TTS 播报)两条路径调用,
+ * 而它内部用的是静态 out32 缓冲,必须串行化,否则两块音频互相覆盖。 */
+static SemaphoreHandle_t tx_mutex = NULL;
+/* 本地监听默认关闭:它是调试手段,开着会和 TTS 播报抢喇叭、并把麦克风
+ * 拾到的声音再放出去形成啸叫。需要时用 MYHAL_MIC_SetMonitor(true) 打开。*/
+static volatile bool mic_monitor_enabled = false;
 
 /* 采集任务：持续读 I2S → 24bit→16bit → 压入流缓冲。
  * 高优先级、整帧非阻塞写入：下游阻塞时丢整帧，绝不卡住采集导致 overrun。*/
 static void mic_task(void *arg)
 {
-    /* ESP32-S3 STD mono：DMA 仍按 stereo 交错传输(total_slot=2)，
-     * buffer 布局为 [L,R,L,R,...]。读 PCM_SAMPLES 个立体声帧后取左声道
-     * 降为单声道。用 static 避免大数组撑爆任务栈（单例任务，安全）。*/
-    static int32_t pcm32[PCM_SAMPLES * 2];   // 立体声交错，2 倍 mono 样本
+    /* ESP32-S3 STD mono：驱动/硬件为"打包单声道"(rx_mono + chan_mask=左slot)，
+     * DMA 每帧只有 1 个 32bit 样本，无 [L,R] 交错——不要再做奇偶抽取!
+     * (旧版 ESP32 驱动才是交错布局。) 用 static 避免大数组撑爆任务栈。*/
+    static int32_t pcm32[PCM_SAMPLES];   // 100ms 打包单声道样本
     static int16_t pcm16[PCM_SAMPLES];
     const size_t frame_bytes = sizeof(pcm16);
     uint32_t drop_cnt = 0;
@@ -40,10 +49,11 @@ static void mic_task(void *arg)
             continue;
         }
 
-        /* 取左声道(偶数索引)。若麦克风 L/R 接右声道导致静音，
-         * 改为 pcm32[2*i + 1] 取右声道。*/
+        /* 打包单声道:每样本直接取高 16bit。
+         * 若麦克风 L/R 接了 VDD(右声道),驱动只收左 slot,采出来是全 0 静音,
+         * 需把 L/R 改接 GND(硬件接法,不是软件能改的)。*/
         for (int i = 0; i < PCM_SAMPLES; i++) {
-            pcm16[i] = pcm32[2 * i] >> 16;    // 32bit slot(24bit有效) → 16bit
+            pcm16[i] = pcm32[i] >> 16;       // 32bit slot(24bit有效) → 16bit
         }
 
         /* 整帧写入或整帧丢弃，避免半帧写入破坏字节对齐 */
@@ -90,7 +100,6 @@ void MYHAL_MIC_Init(void){
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &rx_std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
 
     i2s_std_config_t tx_std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
@@ -112,9 +121,17 @@ void MYHAL_MIC_Init(void){
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_std_cfg));
+
+    /* 全双工通道共享 BCLK/WS，两个方向都配置完成后再启动时钟。 */
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
 
     /* 音频流缓冲 + 采集任务（高优先级，保证 I2S 不 overrun）*/
+    tx_mutex = xSemaphoreCreateMutex();
+    if (tx_mutex == NULL) {
+        ESP_LOGE(TAG, "tx mutex create failed");
+        return;
+    }
     mic_stream = xStreamBufferCreate(MIC_STREAM_BYTES, 1);
     if (mic_stream == NULL) {
         ESP_LOGE(TAG, "stream buffer create failed");
@@ -138,4 +155,49 @@ int MYHAL_MIC_Take(int16_t *out, int max_samples)
     size_t want = (size_t)max_samples * sizeof(int16_t);
     size_t got = xStreamBufferReceive(mic_stream, out, want, pdMS_TO_TICKS(200));
     return (int)(got / sizeof(int16_t));
+}
+
+/* 播放接口：16bit 单声道 → 32bit slot → 写扬声器(TX)。
+ * TX mono 时硬件自动把同一 32bit 样本复制到左右两 slot(tx_chan_equal),
+ * 直接写打包单声道流即可,无需奇偶展开。扬声器回声进麦会啸叫,注意隔离。
+ * 线程安全:内部 tx_mutex 串行化,可被监听与 TTS 两条路径并发调用。*/
+void MYHAL_MIC_Play(const int16_t *data, int samples)
+{
+    if (tx_handle == NULL || data == NULL || samples <= 0) {
+        return;
+    }
+    static int32_t out32[MIC_SAMPLES];   /* tx_mutex 保护下的单例缓冲 */
+    if (samples > MIC_SAMPLES) {
+        samples = MIC_SAMPLES;
+    }
+
+    if (tx_mutex) xSemaphoreTake(tx_mutex, portMAX_DELAY);
+
+    for (int i = 0; i < samples; i++) {
+        /* 乘法避免对负的有符号整数左移（C 语言未定义行为）。 */
+        out32[i] = (int32_t)data[i] * 65536;
+    }
+    const size_t wanted = (size_t)samples * sizeof(int32_t);
+    size_t written = 0;
+    esp_err_t ret = i2s_channel_write(tx_handle, out32, wanted,
+                                      &written, pdMS_TO_TICKS(200));
+    if ((ret != ESP_OK || written != wanted) && ((++play_fail_count & 0x3F) == 1)) {
+        ESP_LOGW(TAG, "I2S write fail/short: ret=%d bytes=%u/%u",
+                 ret, (unsigned)written, (unsigned)wanted);
+    }
+
+    if (tx_mutex) xSemaphoreGive(tx_mutex);
+}
+
+/* 本地监听开关:默认关。开着时 asr_send_task 会把送 ASR 的音频同步回放,
+ * 用于确认麦克风通路是否正常;接上 TTS 播报后应保持关闭。*/
+void MYHAL_MIC_SetMonitor(bool enabled)
+{
+    mic_monitor_enabled = enabled;
+    ESP_LOGI(TAG, "local monitor %s", enabled ? "ON" : "OFF");
+}
+
+bool MYHAL_MIC_GetMonitor(void)
+{
+    return mic_monitor_enabled;
 }

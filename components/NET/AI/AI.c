@@ -51,6 +51,22 @@ static void mem_put(char *dst, const char *src)
     dst[cut] = '\0';
 }
 
+/* 追加一格到第 d 维。带边界保护:满了就整体上移丢掉最旧一条,再写末格。
+ * 原来直接 mem_grid[0][mem_cnt[0]++] 没有上界——digest 只是"请"AI 返回,
+ * AI 不返回(或走了 fallback 分支)时 mem_cnt[0] 会一路涨,写穿整个网格。*/
+static void mem_push(int d, const char *src)
+{
+    if (d < 0 || d >= MEM_DIM || src == NULL) return;
+    if (mem_cnt[d] >= MEM_SLOTS) {
+        ESP_LOGW(TAG, "mem dim%d full (no digest), drop oldest", d);
+        for (int s = 0; s < MEM_SLOTS - 1; s++)
+            memcpy(mem_grid[d][s], mem_grid[d][s + 1], MEM_LEN);
+        mem_cnt[d] = MEM_SLOTS - 1;
+    }
+    mem_put(mem_grid[d][mem_cnt[d]], src);
+    mem_cnt[d]++;
+}
+
 
 static char response_buffer[8192];
 static int resp_index = 0;
@@ -82,12 +98,19 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 static void AI_request(char *Message)
 {
+    /* 清游标的同时必须清内容:HTTP 失败时 esp_http_client 不会派发
+     * HTTP_EVENT_ON_FINISH,response_buffer 里仍是上一轮的响应体。若此处
+     * 只把 resp_index 归零,下一轮 perform 失败后 parse_ai_response 会把
+     * 上一轮的响应再解析一遍,把同一条动作重新塞进 ai_cmd_queue —— 用户
+     * 没说话,车却自己动。清空后最坏情况只是解析空串失败。*/
     resp_index = 0;
+    response_buffer[0] = '\0';
 
     esp_http_client_config_t config = {
         .url = "https://api.deepseek.com/v1/chat/completions",
         .event_handler = http_event_handler,
-        .skip_cert_common_name_check = true,
+        /* 已经挂了 crt_bundle 做链校验,再关 common name 校验只会白白削弱 TLS,
+         * 让中间人用任意受信证书冒充 api.deepseek.com。保持默认(校验开启)。*/
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 20000,        /* 给 deepseek 足够时间生成 memory */
     };
@@ -123,9 +146,10 @@ static void AI_request(char *Message)
     static char user_content[4096];   /* 25格全满+格式≈2.5KB,static不占栈 */
     int pos = 0;
 
-    /* 提炼标记:某维满5格时,让AI在回复里附带digest */
+    /* 提炼标记:某维满5格时,让AI在回复里附带digest。
+     * 最后一维没有上级可承接,不参与 digest(它的溢出由 mem_push 丢最旧兜底)。*/
     digest_dim = -1;
-    for (int d = 0; d < MEM_DIM; d++) {
+    for (int d = 0; d < MEM_DIM - 1; d++) {
         if (mem_cnt[d] == MEM_SLOTS) { digest_dim = d; break; }
     }
     if (digest_dim >= 0) {
@@ -187,6 +211,11 @@ static void parse_ai_response(void)
         ESP_LOGW(TAG, "parse skip: HTTP 未完成(PermitLock 未 Free)");
         return;
     }
+    /* 立刻上锁,不能等到函数末尾:下面有多个提前 return(解析失败/无 choices/
+     * 无 message/fallback 提取),只在末尾上锁会让这些路径把锁留在 Free,
+     * 于是下一轮即使 HTTP 失败也会放行解析。*/
+    AITRANSCJSON_PermitLock = PermitLock_Lock;
+
     cJSON *root = cJSON_Parse(response_buffer);
     if(root == NULL){
         ESP_LOGW(TAG, "parse fail, response: %s", response_buffer);
@@ -239,13 +268,16 @@ static void parse_ai_response(void)
         cJSON *actions = cJSON_GetObjectItem(rootin, "actions");
         cJSON *memory  = cJSON_GetObjectItem(rootin, "memory");
 
-        /* voice → 语音队列 */
-        if (voice && voice->valuestring) {
+        /* voice → 语音队列(tts_task 消费,走阿里云 NLS 合成后由喇叭播出) */
+        if (voice && voice->valuestring && voice->valuestring[0]) {
             ai_voice_t voice_msg;
+            memset(&voice_msg, 0, sizeof(voice_msg));
             strncpy(voice_msg.buf, voice->valuestring, sizeof(voice_msg.buf) - 1);
-            voice_msg.buf[sizeof(voice_msg.buf) - 1] = '\0';
-            xQueueSend(ai_voice_queue, &voice_msg, 0);
-            printf("voice: %s\n", voice->valuestring);
+            if (xQueueSend(ai_voice_queue, &voice_msg, 0) != pdPASS) {
+                ESP_LOGW(TAG, "ai_voice_queue full, voice dropped: %s", voice_msg.buf);
+            } else {
+                printf("voice: %s\n", voice_msg.buf);
+            }
         }
 
         /* actions[] → 逐条塞控制队列 */
@@ -285,17 +317,15 @@ static void parse_ai_response(void)
             int d_up = digest_dim + 1;
             memset(mem_grid[digest_dim], 0, sizeof(mem_grid[digest_dim]));
             mem_cnt[digest_dim] = 0;
-            mem_put(mem_grid[d_up][mem_cnt[d_up]], digest->valuestring);
-            mem_cnt[d_up]++;
+            mem_push(d_up, digest->valuestring);
             printf("digest: dim%d→dim%d[%d]\n", digest_dim, d_up, mem_cnt[d_up] - 1);
         }
         digest_dim = -1;
 
         /* memory:当前轮存入第0维下一格 */
         if (memory && memory->valuestring) {
-            mem_put(mem_grid[0][mem_cnt[0]], memory->valuestring);
-            printf("memory[0][%d]: %s\n", mem_cnt[0], mem_grid[0][mem_cnt[0]]);
-            mem_cnt[0]++;
+            mem_push(0, memory->valuestring);
+            printf("memory[0][%d]: %s\n", mem_cnt[0] - 1, mem_grid[0][mem_cnt[0] - 1]);
         }
 
         cJSON_Delete(rootin);   /* 必须释放,否则每次请求泄漏一棵 JSON 树 */
@@ -305,17 +335,19 @@ static void parse_ai_response(void)
         ESP_LOGW(TAG, "no content");
     }
 
-    cJSON_Delete(root);
-    AITRANSCJSON_PermitLock = PermitLock_Lock;
+    cJSON_Delete(root);   /* 锁已在函数开头置为 Lock,此处不再重复 */
 }
 
 void ai_task(void *arg) {
-
-    while (WIFIGOTIP_PermitLock != PermitLock_Free) {   // ← while
-        vTaskDelay(100);
-    }
     while (1) {
         static char buf[256];
+
+        /* 未拿到 IP(开机初期或掉线中)就挂起:WIFI.c 在 GOT_IP 时置 Free、
+         * 在 DISCONNECTED 时置回 Lock,所以这里逐轮检查即可覆盖重连。*/
+        if (WIFIGOTIP_PermitLock != PermitLock_Free) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         asr_result_t new_cmd;
 
@@ -344,5 +376,6 @@ void AI_Init(void) {
     if (CONFIG_DEEPSEEK_API_KEY[0] == '\0') {
         ESP_LOGE(TAG, "DeepSeek API key 未配置!请在 menuconfig 的 'AI 语音控制配置' 中填写");
     }
-      /* HTTPS+TLS 栈消耗大,4K 会溢出 */
+    /* 注意:ai_task 栈必须给到 12288——HTTPS+TLS 握手 + cJSON 解析开销大,4K 会溢出。
+     * 见 SER_AIWORK_CreatPin() 里 ai_task 的栈参数。*/
 }

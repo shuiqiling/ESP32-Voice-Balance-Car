@@ -10,6 +10,7 @@ static pcnt_unit_handle_t ENCODER_Unit_HANDLE[BSP_ENCODER_NUM];
 static pcnt_channel_handle_t ENCODER_Chan_HANDLE[BSP_ENCODER_NUM];
 static int MYHAL_ENCODER_CURRENTCOUNT[BSP_ENCODER_NUM];
 static int MYHAL_ENCODER_LASTCOUNT[BSP_ENCODER_NUM];
+static int MYHAL_ENCODER_LASTVALID[BSP_ENCODER_NUM];   /* 最近一次成功读到的计数 */
 
 void MYHAL_ENCODER_Init(BSP_ENCODER_ID_m MYHAL_ENCODER_ID){
     esp_err_t ret;
@@ -71,14 +72,30 @@ void MYHAL_ENCODER_Init(BSP_ENCODER_ID_m MYHAL_ENCODER_ID){
 }
 
 int MYHAL_ENCODER_GetCounter(BSP_ENCODER_ID_m MYHAL_ENCODER_ID){
-    int value;
-    pcnt_unit_get_count(ENCODER_Unit_HANDLE[MYHAL_ENCODER_ID], &value);
+    /* 两条防线。原来这里是 `int value;` 加一句忽略返回值的调用:
+     * ① 初始化失败时句柄是 NULL,pcnt_unit_get_count 会直接返回且不写 *value,
+     *    于是那个未初始化的栈变量被控制环当成真实位置用 —— 车会一次满速纠正;
+     * ② 读失败同理。两种情况下都沿用上次有效值(不动作)比返回 0 安全:
+     *    位置本来在 5000,突然读成 0 会被当成 5000 的偏差去追。*/
+    if (ENCODER_Unit_HANDLE[MYHAL_ENCODER_ID] == NULL) {
+        return MYHAL_ENCODER_LASTVALID[MYHAL_ENCODER_ID];
+    }
+    int value = 0;
+    if (pcnt_unit_get_count(ENCODER_Unit_HANDLE[MYHAL_ENCODER_ID], &value) != ESP_OK) {
+        return MYHAL_ENCODER_LASTVALID[MYHAL_ENCODER_ID];
+    }
+    MYHAL_ENCODER_LASTVALID[MYHAL_ENCODER_ID] = value;
     return value;
 }
 
 int MYHAL_ENCODER_GetSpeedCounter(BSP_ENCODER_ID_m MYHAL_ENCODER_ID){
+    if (ENCODER_Unit_HANDLE[MYHAL_ENCODER_ID] == NULL) {
+        return 0;
+    }
     int MYHAL_ENCODER_TEMPCOUNT;
-    pcnt_unit_get_count(ENCODER_Unit_HANDLE[MYHAL_ENCODER_ID], &MYHAL_ENCODER_CURRENTCOUNT[MYHAL_ENCODER_ID]);
+    if (pcnt_unit_get_count(ENCODER_Unit_HANDLE[MYHAL_ENCODER_ID], &MYHAL_ENCODER_CURRENTCOUNT[MYHAL_ENCODER_ID]) != ESP_OK) {
+        return 0;   /* 读失败:本轮增量算 0,不要用残值凑一个假速度 */
+    }
     MYHAL_ENCODER_TEMPCOUNT = MYHAL_ENCODER_CURRENTCOUNT[MYHAL_ENCODER_ID] - MYHAL_ENCODER_LASTCOUNT[MYHAL_ENCODER_ID];
     if (MYHAL_ENCODER_TEMPCOUNT > MYHAL_ENCODER_COUNT_LIMIT/2)
         MYHAL_ENCODER_TEMPCOUNT -= MYHAL_ENCODER_COUNT_LIMIT;

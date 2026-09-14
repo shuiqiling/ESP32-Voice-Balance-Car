@@ -14,10 +14,9 @@
 static const char *TAG = "ASR";
 
 static char task_id[37];
-QueueHandle_t asr_queue = NULL;   /* ASR 识别结果队列(SystemState.h 里 extern) */
+QueueHandle_t asr_queue = NULL;
 
-/* 生成 32 位 hex 的会话 ID(不按标准 UUID 分组,格式与长度固定,
- * 4×esp_random 保证唯一性;全部用 %08lx + 强转,避免 32/64 位参数不匹配) */
+
 static void uuid_generate(char *uuid)
 {
     uint32_t a = esp_random();
@@ -30,9 +29,7 @@ static void uuid_generate(char *uuid)
             (unsigned long)c, (unsigned long)d);
 }
 
-/* ===== WebSocket 文本帧重组缓冲 =====
- * 服务端 JSON 消息可能跨帧分片到达(payload_offset/fin),逐片拼接,
- * 消息完整(fin)后再解析。static:不占回调栈。 */
+
 static char asr_json[2048];
 static int  asr_json_len = 0;
 
@@ -51,7 +48,9 @@ static void asr_handle_json(const char *json)
                 strncpy(r.cmd, result->valuestring, sizeof(r.cmd) - 1);
                 r.cmd[sizeof(r.cmd) - 1] = '\0';
                 ESP_LOGI(TAG, "识别: %s", r.cmd);
-                xQueueSend(asr_queue, &r, 0);
+                if (asr_queue == NULL || xQueueSend(asr_queue, &r, 0) != pdPASS) {
+                    ESP_LOGW(TAG, "ASR result queue unavailable/full, result dropped");
+                }
             }
         }
         cJSON_Delete(root);    /* 一定要释放,否则内存泄漏 */
@@ -71,20 +70,20 @@ static void websocket_event_handler(
     {
         case WEBSOCKET_EVENT_CONNECTED:{
             ESP_LOGI(TAG,"Connected");
-            /* TCP 断开时服务端会话随之失效,重连后直接开新会话(新 task_id)即可 */
+            
             ASR_Start();
             break;
         }
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "WebSocket Disconnected, pause sending");
-            ASRSENDDATACJSON_PermitLock = PermitLock_Lock;   // 暂停发送,等重连后恢复
+            ASRSENDDATACJSON_PermitLock = PermitLock_Lock;   
             break;
 
         case WEBSOCKET_EVENT_DATA:{
             esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
             if (data->op_code != 0x01) break;   /* 只处理文本帧 */
 
-            /* 分片重组:新消息首片复位缓冲,逐片拼接,fin 后整条解析 */
+
             if (data->payload_offset == 0) asr_json_len = 0;
             if (data->data_len > 0) {
                 int room = (int)sizeof(asr_json) - 1 - asr_json_len;
@@ -115,6 +114,18 @@ static esp_websocket_client_handle_t ws_client = NULL;
 
 void ASR_Init(void){
 
+    /* 回调可能在 client_start 返回前后立即执行，先创建回调依赖的队列。 */
+    asr_queue = xQueueCreate(4, sizeof(asr_result_t));
+    if (asr_queue == NULL) {
+        ESP_LOGE(TAG, "queue create fail");
+        return;
+    }
+
+    if (CONFIG_ASR_TOKEN[0] == '\0' || CONFIG_ASR_APPKEY[0] == '\0') {
+        ESP_LOGE(TAG, "ASR token/appkey 未配置!请在 menuconfig 的 'AI 语音控制配置' 中填写");
+        return;
+    }
+
     char ws_uri[256];
 
     snprintf(ws_uri,
@@ -123,30 +134,29 @@ void ASR_Init(void){
          CONFIG_ASR_TOKEN);
     esp_websocket_client_config_t cfg = {
         .uri = ws_uri,
-        .crt_bundle_attach = esp_crt_bundle_attach,  // 验证服务器证书
-        .buffer_size = 4096,         // 容纳 100ms PCM(3200B),避免分片
-        .ping_interval_sec = 10,     // WebSocket 心跳保活(默认即10,显式声明)
-        .keep_alive_enable = true,   // TCP 保活,检测半开连接并触发重连
+        .crt_bundle_attach = esp_crt_bundle_attach, 
+        .buffer_size = 4096,        
+        .ping_interval_sec = 10,     
+        .keep_alive_enable = true,   
         .keep_alive_idle = 10,
         .keep_alive_interval = 5,
         .keep_alive_count = 3,
-        .reconnect_timeout_ms = 3000, // 断连后 3 秒自动重连(默认 10 秒)
+        .reconnect_timeout_ms = 3000, 
     };
     ws_client = esp_websocket_client_init(&cfg);
+    if (ws_client == NULL) {
+        ESP_LOGE(TAG, "WebSocket client init fail");
+        return;
+    }
 
     esp_websocket_register_events(ws_client,
         WEBSOCKET_EVENT_ANY,
         websocket_event_handler,
         ws_client);
 
-    esp_websocket_client_start(ws_client);
-
-    asr_queue = xQueueCreate(4, sizeof(asr_result_t));   // 深度4 = 缓存4条指令
-    if (asr_queue == NULL){
-        ESP_LOGE(TAG, "queue create fail");
-    }
-    if (CONFIG_ASR_TOKEN[0] == '\0' || CONFIG_ASR_APPKEY[0] == '\0') {
-        ESP_LOGE(TAG, "ASR token/appkey 未配置!请在 menuconfig 的 'AI 语音控制配置' 中填写");
+    esp_err_t ret = esp_websocket_client_start(ws_client);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WebSocket client start fail: %s", esp_err_to_name(ret));
     }
 }
 
@@ -190,8 +200,7 @@ CONFIG_ASR_APPKEY);
     ESP_LOGI(TAG, "StartTranscription sent");
 }
 
-/* 发送任务：持续从麦克风流缓冲取 PCM，经 WebSocket 带超时发送。
- * 与采集任务解耦，网络阻塞不会拖累 I2S 采集导致 overrun。*/
+
 void asr_send_task(void *arg)
 {
     static int16_t pcm[MIC_SAMPLES];
@@ -205,7 +214,19 @@ void asr_send_task(void *arg)
             continue;
         }
 
-        /* 转写未就绪时丢弃此帧，防止缓冲堆积 */
+        /* 本地监听:播放与发送给 ASR 的同一份数据(扬声器回声进麦会啸叫)。
+         * 默认关闭——喇叭要留给 TTS 播报,两者混在一起会互相打断。*/
+        if (MYHAL_MIC_GetMonitor()) {
+            MYHAL_MIC_Play(pcm, got);
+        }
+
+        /* TTS 正在播报:喇叭的声音会被本机麦克风拾到,原样送到阿里云就会被
+         * 识别成一条新指令,再触发一次播报 —— 自己和自己对话的死循环。
+         * 固件里没有 AEC,只能整帧丢弃;等 tts_play_task 把缓冲放空再恢复。*/
+        if (tts_speaking) {
+            continue;
+        }
+
         if (ASRSENDDATACJSON_PermitLock != PermitLock_Free) {
             drop++;
             if (drop - last_log >= 50) {   /* 节流打印,避免刷屏 */

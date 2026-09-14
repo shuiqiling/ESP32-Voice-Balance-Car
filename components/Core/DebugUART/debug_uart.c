@@ -119,16 +119,28 @@ static void dbg_vofa_send(const float *data, int count)
     char buf[256];
     int pos = 0;
     for (int i = 0; i < count; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "%f%s",
-                        data[i], (i == count - 1) ? "\n" : ",");
+        /* 必须留够余量再 snprintf。`sizeof(buf) - pos` 是 size_t 运算:
+         * 一旦 pos 超过 256,这个减法会回绕成约 4G,snprintf 会以为自己有
+         * 4GB 可用空间直接写穿这个栈数组 —— 不是截断,是栈溢出。
+         * (%f 最长约 45 字符,这里留 48。)*/
+        if (pos >= (int)sizeof(buf) - 48) {
+            if (pos < (int)sizeof(buf) - 1) buf[pos++] = '\n';   /* 截断也要有帧尾 */
+            break;
+        }
+        int n = snprintf(buf + pos, sizeof(buf) - pos, "%f%s",
+                         data[i], (i == count - 1) ? "\n" : ",");
+        if (n < 0) break;
+        pos += n;
     }
     uart_write_bytes(DBG_UART_PORT, buf, pos);
 }
 
-/* 串口命令解析 → 在线调 PID 参数
+/* 单行命令解析 → 在线调 PID 参数
  * 格式: "akp 25\n" → 角度环Kp, "skp 0.2\n" → 速度环Kp,
  *       "akd 1.5\n" → 角度环Kd, "pos 100 -100\n" → 目标位置(mm)
  */
+static void dbg_process_line(const char *line);
+
 void dbg_process_cmd(const uint8_t *data, int len)
 {
     char line[64];
@@ -136,13 +148,22 @@ void dbg_process_cmd(const uint8_t *data, int len)
     memcpy(line, data, len);
     line[len] = '\0';
 
-    /* 去掉末尾换行 */
-    char *e = strpbrk(line, "\r\n");
-    if (e) *e = '\0';
+    /* 一次读到的可能是多行(上位机连续下发 "akp 25\nakd 1\n")。原来只取
+     * 第一行、把后面的整段丢掉,操作者以为两条都生效了,实际只改了 Kp。*/
+    char *p = line;
+    while (p && *p) {
+        char *nl = strpbrk(p, "\r\n");
+        if (nl) *nl = '\0';
+        if (*p) dbg_process_line(p);      /* 跳过空行 */
+        p = nl ? nl + 1 : NULL;
+    }
+}
 
+static void dbg_process_line(const char *line)
+{
     float val = 0.0f;
     char cmd[8] = {0};
-    sscanf(line, "%7s %f", cmd, &val);
+    if (sscanf(line, "%7s %f", cmd, &val) < 1) return;   /* 解析不到命令名就忽略 */
 
     if      (strcmp(cmd, "akp") == 0) PID_Angle_SetKp(val);
     else if (strcmp(cmd, "aki") == 0) PID_Angle_SetKi(val);
@@ -155,9 +176,20 @@ void dbg_process_cmd(const uint8_t *data, int len)
     else if (strcmp(cmd, "pkd") == 0) PID_Position_SetKd(val);
     else if (strcmp(cmd, "pos") == 0) {
         float r = 0, l = 0;
-        sscanf(line, "pos %f %f", &r, &l);  /* "pos 100 -100" → 右100mm 左-100mm */
+        /* 两个参数都必须给。原来忽略 sscanf 返回值而 l 预置 0,于是
+         * "pos 100"(漏写左轮)会静默地把左轮目标设成 0 —— 一条没打算下的指令。*/
+        if (sscanf(line, "pos %f %f", &r, &l) != 2) {
+            dbg_printf("? pos 需要两个值: pos <右mm> <左mm>\n");
+            return;
+        }
+        /* 两个目标值 + 待处理标志必须整体原子写入。控制任务在另一个核上,
+         * 若它在标志置位后、目标值写完前拿到 CPU,会读到"右轮新命令 +
+         * 左轮旧命令"的混合目标 —— 直行变成转向。*/
+        portENTER_CRITICAL(&ser_pos_mux);
         ser_pos_target_r = r;
         ser_pos_target_l = l;
+        ser_pos_cmd_pending = true;
+        portEXIT_CRITICAL(&ser_pos_mux);
         dbg_printf("pos: R=%.0f L=%.0f\n", r, l);
     }
     else if (strcmp(cmd, "info") == 0) {

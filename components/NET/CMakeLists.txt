@@ -2,12 +2,14 @@ set(src_dirs
         WIFI
         AI
         ASR
+        TTS
 )
 
 set(include_dirs
         WIFI
         AI
         ASR
+        TTS
 )
 
 set(requires_dirs

@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM10",
+  "idf.portWin": "COM9",
   "idf.toolsPathWin": "d:\\esp\\Espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -17,5 +17,5 @@
     "--compile-commands-dir=d:\\esp\\esp32_project\\02_key_control_led\\02_key_control_led_v2\\build"
   ],
   "idf.currentSetup": "d:\\esp\\esp-idf\\v5.5.4\\esp-idf",
-  "idf.flashType": "UART"
+  "idf.flashType": "JTAG"
 }

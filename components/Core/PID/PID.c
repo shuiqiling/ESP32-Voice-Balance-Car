@@ -28,6 +28,14 @@ float PID_Angle_BalanceCar(float RefenceValue, float CurrentValue, float AngleSp
 
     float Pout = PID_Angle_Kp * CurrentError;
     PID_Angle_Iout += PID_Angle_Ki * CurrentError;
+    /* 角度环是唯一不经过上级、直接驱动电机的环,积分必须有界。原来只有这里
+     * 没限幅:车被按住/顶住倾角偏置期间输出早已夹在 ±100,而 Iout 还在涨,
+     * 松手回正后要靠它自己慢慢退绕 —— 表现就是"松手瞬间满速冲出去"。
+     * 这里夹到与输出同量程,保证积分单独就能顶满输出时不再继续累积。
+     * 若实测需要更弱的积分权限,把 ±100 收紧即可(速度环用 ±10,位置环 ±20)。*/
+    if (PID_Angle_Iout >  100.0f) PID_Angle_Iout =  100.0f;
+    if (PID_Angle_Iout < -100.0f) PID_Angle_Iout = -100.0f;
+
     PID_Angle_Dout = (1.0f - PID_Angle_DOUTAEF) * PID_Angle_Kd * AngleSpeed / 131.0f
                    + PID_Angle_DOUTAEF * PID_Angle_Dout;
 

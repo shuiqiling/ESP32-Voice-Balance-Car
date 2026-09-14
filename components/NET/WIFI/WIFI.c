@@ -14,6 +14,11 @@ static const char *TAG = "WIFI";
 /* 断线重连:指数退避(1,2,4,8,16,32s),之后固定 60s,避免重连风暴 */
 #define WIFI_RETRY_MAX_BACKOFF_S 60
 #define WIFI_RETRY_INIT_BACKOFF_S 1
+/* 移位上限。retry_cnt 只在拿到 IP 时清零,长期连不上(密码错/AP 不在范围)会一直涨,
+ * 到 31 次时 1<<retry_cnt 是有符号左移溢出(UB),实测得到负数,再被转成
+ * uint64 微秒就是一个几乎永不触发的超时,WiFi 从此再也回不来。
+ * 1<<6 = 64 已超过 60s 上限,所以卡在 6 不影响退避曲线。 */
+#define WIFI_RETRY_MAX_SHIFT 6
 
 static int retry_cnt = 0;
 static esp_timer_handle_t retry_timer = NULL;
@@ -39,17 +44,29 @@ static void WIFI_EventHandler(
                 break;
 
             case WIFI_EVENT_STA_DISCONNECTED: {
+                /* 先卡上限再移位,避免 1<<retry_cnt 溢出(见 WIFI_RETRY_MAX_SHIFT) */
+                if (retry_cnt > WIFI_RETRY_MAX_SHIFT) retry_cnt = WIFI_RETRY_MAX_SHIFT;
                 int delay_s = WIFI_RETRY_INIT_BACKOFF_S << retry_cnt;
                 if (delay_s > WIFI_RETRY_MAX_BACKOFF_S) delay_s = WIFI_RETRY_MAX_BACKOFF_S;
-                retry_cnt++;
+                if (retry_cnt < WIFI_RETRY_MAX_SHIFT) retry_cnt++;
                 ESP_LOGW(TAG, "Disconnected, retry in %ds", delay_s);
+
+                /* 掉线后重新上锁,让 ai_task 回到等待状态,不在无网时继续发请求 */
+                WIFIGOTIP_PermitLock = PermitLock_Lock;
 
                 if (retry_timer == NULL) {
                     esp_timer_create_args_t args = {
                         .callback = wifi_retry_connect,
                         .name = "wifi_retry"
                     };
-                    esp_timer_create(&args, &retry_timer);
+                    esp_err_t terr = esp_timer_create(&args, &retry_timer);
+                    if (terr != ESP_OK) {
+                        ESP_LOGE(TAG, "retry timer create fail: %s, connect now",
+                                 esp_err_to_name(terr));
+                        retry_timer = NULL;
+                        esp_wifi_connect();   /* 建不出定时器就立刻重连,别把重连卡死 */
+                        break;
+                    }
                 }
                 esp_timer_start_once(retry_timer, (uint64_t)delay_s * 1000 * 1000);
                 break;
